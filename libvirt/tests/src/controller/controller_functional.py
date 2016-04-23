@@ -1,10 +1,13 @@
 import re
 import logging
+import platform
 
 from autotest.client.shared import error
 
+from provider import libvirt_version
 from virttest import virt_vm
 from virttest import virsh
+from virttest import utils_misc
 from virttest.utils_test import libvirt
 from virttest.libvirt_xml.vm_xml import VMXML
 from virttest.libvirt_xml.devices.controller import Controller
@@ -50,19 +53,30 @@ def run(test, params, env):
     def setup_os_xml():
         """
         Prepare os part of VM XML according to params.
+        Return processed machine type.
         """
         osxml = vm_xml.os
-        orig_machine = osxml.machine
-        if '-' in orig_machine:
-            suffix = orig_machine.split('-')[-1]
-            new_machine = '-'.join(('pc', os_machine, suffix))
+
+        matching_machines = [machine for machine in supported_machines
+                             if os_machine in machine]
+
+        if matching_machines:
+            if os_machine in matching_machines:
+                new_machine = os_machine
+            else:
+                new_machine = matching_machines[0]
+            logging.info("Found machine names %s matching '%s'. Using '%s'",
+                         matching_machines, os_machine, new_machine)
         else:
+            logging.info("Not found machine names matching '%s'", os_machine)
             if os_machine == 'i440fx':
+                logging.info("Using 'pc' as machine type")
                 new_machine = 'pc'
             else:
                 new_machine = os_machine
         osxml.machine = new_machine
         vm_xml.os = osxml
+        return new_machine
 
     def setup_controller_xml():
         """
@@ -120,14 +134,34 @@ def run(test, params, env):
             'usb': ['ehci', 'ich9-ehci1'],
         }
 
-        if cntlr_type == 'pci' and model is None:
-            fail_patts.append(r"Invalid PCI controller model")
+        if cntlr_type == 'pci':
+            if model is None:
+                fail_patts.append(r"Invalid PCI controller model")
+            # RHEL6 doesn't support pci controller
+            if not libvirt_version.version_compare(1, 0, 5):
+                fail_patts.append(r"Unknown controller type 'pci'")
         if model is not None and model not in known_models[cntlr_type]:
             fail_patts.append(r"Unknown model type")
-        if os_machine == 'q35' and model in ['pci-root', 'pci-bridge']:
-            fail_patts.append(r"Device requires a PCI Express slot")
-        if os_machine == 'i440fx' and model == 'pcie-root':
+        if 'q35' in xml_machine:
+            if model in ['pci-root', 'pci-bridge']:
+                fail_patts.append(r"Device requires a PCI Express slot")
+            if 'ppc' in platform.machine() and cntlr_type != 'pci':
+                fail_patts.append(r"Device requires a PCI Express slot")
+        if (xml_machine not in supported_machines and
+                'ppc' not in platform.machine() and
+                libvirt_version.version_compare(1, 0, 5) and
+                cntlr_type != 'pci'):
+            # TODO: possible a bug
+            fail_patts.append(r"No PCI buses available")
+        if (('i440fx' in xml_machine or xml_machine == 'pc') and
+                model == 'pcie-root'):
             fail_patts.append(r"Device requires a standard PCI slot")
+        if model == 'pcie-root' and 'ppc' in platform.machine():
+            # TODO: possible a bug
+            fail_patts.append(r"too many devices with fixed addresses")
+        if model == 'pcie-root' and xml_machine not in supported_machines:
+            # TODO: possible a bug
+            fail_patts.append(r"too many devices with fixed addresses")
         # isdigit will return false on negative number, which just meet the
         # requirement of this test.
         if index is not None and not index.isdigit():
@@ -145,6 +179,17 @@ def run(test, params, env):
         fail_patts = []
         if model == 'pci-bridge' and (index is None or int(index) == 0):
             fail_patts.append(r"PCI bridge index should be > 0")
+        if pcihole is not None and not utils_misc.is_qemu_capability_supported(
+                '%s-pci-hole64-size' % os_machine):
+            fail_patts.append(r"64-bit PCI hole size setting is not supported")
+            fail_patts.append(r"Setting the 64-bit PCI hole size is not supported")
+        if xml_machine not in supported_machines:
+            logging.info("machine type '%s' not in qemu supported list %s",
+                         xml_machine, supported_machines)
+            fail_patts.append(r"Unsupported machine type")
+        if 'pseries' not in os_machine and 'ppc' in platform.machine():
+            fail_patts.append(r"only pSeries guests support panic device of "
+                              "model 'pseries'")
         res = virsh.start(vm_name)
         libvirt.check_result(res, expected_fails=fail_patts)
         return not res.exit_status
@@ -233,7 +278,7 @@ def run(test, params, env):
         if addr_str is None:
             raise error.TestError("Can't find target controller in XML")
 
-        session = vm.wait_for_login()
+        session = vm.wait_for_serial_login()
         status, output = session.cmd_status_output('lspci -vvv -s %s' % addr_str)
         logging.debug("lspci output is: %s", output)
 
@@ -257,6 +302,8 @@ def run(test, params, env):
     usb_cntlr_addr = params.get('usb_controller_address', None)
     vm_name = params.get("main_vm", "avocado-vt-vm1")
 
+    supported_machines, _ = utils_misc.get_support_machine_type()
+
     vm = env.get_vm(vm_name)
     vm_xml = VMXML.new_from_inactive_dumpxml(vm_name)
     vm_xml_backup = vm_xml.copy()
@@ -265,7 +312,7 @@ def run(test, params, env):
         remove_all_addresses(vm_xml)
         remove_usb_devices(vm_xml)
         setup_controller_xml()
-        setup_os_xml()
+        xml_machine = setup_os_xml()
         logging.debug("Test VM XML is %s" % vm_xml)
 
         if not define_and_check():
